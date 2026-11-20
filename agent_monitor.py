@@ -145,7 +145,16 @@ def execute_task(issue: Dict, repo: str) -> Dict:
             if lang in ("bash", "sh", "shell", "zsh"):
                 rc, stdout, stderr = run_cmd(["bash", "-c", code])
             elif lang in ("python", "python3", "py"):
-                rc, stdout, stderr = run_cmd(["python3", "-c", code])
+                # If code requires torch or isaaclab, route to IsaacLab python environment
+                if any(pkg in code for pkg in ("torch", "isaaclab", "isaacsim", "pxr", "warp")):
+                    isaac_py = "/home/robotics/isaac/IsaacLab/.venv/bin/python"
+                    if os.path.exists(isaac_py):
+                        env_cmd = f"LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1 {isaac_py} -c {json.dumps(code)}"
+                        rc, stdout, stderr = run_cmd(["bash", "-c", env_cmd])
+                    else:
+                        rc, stdout, stderr = run_cmd(["python3", "-c", code])
+                else:
+                    rc, stdout, stderr = run_cmd(["python3", "-c", code])
             else:
                 rc, stdout, stderr = run_cmd(["bash", "-c", code])
 
