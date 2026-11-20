@@ -50,12 +50,16 @@ def slugify(text: str) -> str:
     return re.sub(r"[-\s]+", "-", text)[:40] or "task"
 
 
-def run_cmd(cmd: List[str], cwd: Optional[str] = None, timeout: float = 300) -> Tuple[int, str, str]:
+def run_cmd(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict] = None, timeout: float = 300) -> Tuple[int, str, str]:
     """Runs a process and returns (returncode, stdout, stderr)."""
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
     try:
         proc = subprocess.run(
             cmd,
             cwd=cwd or DEFAULT_WORKDIR,
+            env=full_env,
             capture_output=True,
             text=True,
             timeout=timeout
@@ -149,8 +153,8 @@ def execute_task(issue: Dict, repo: str) -> Dict:
                 if any(pkg in code for pkg in ("torch", "isaaclab", "isaacsim", "pxr", "warp")):
                     isaac_py = "/home/robotics/isaac/IsaacLab/.venv/bin/python"
                     if os.path.exists(isaac_py):
-                        env_cmd = f"LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1 {isaac_py} -c {json.dumps(code)}"
-                        rc, stdout, stderr = run_cmd(["bash", "-c", env_cmd])
+                        gomp = {"LD_PRELOAD": "/lib/aarch64-linux-gnu/libgomp.so.1"}
+                        rc, stdout, stderr = run_cmd([isaac_py, "-c", code], env=gomp)
                     else:
                         rc, stdout, stderr = run_cmd(["python3", "-c", code])
                 else:
