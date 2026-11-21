@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Agent Tasks Monitor - Autonomous GitHub Issue Worker.
-Watches GitHub Issues on RoboX2020/agent-tasks, acknowledges them,
-executes the requested instructions, saves task artifacts in markdown,
-pushes changes to git, and replies back to the issue before closing it.
+Agent Tasks Monitor - Autonomous GitHub Issue AI Agent.
+Powered by Google Antigravity Agent (Gemini LLM).
+Watches GitHub Issues on RoboX2020/agent-tasks, comprehends complex natural language
+instructions and long user demands, executes commands and simulations autonomously,
+generates artifacts and screenshots, commits & pushes to git, and replies back to the issue.
 """
 
 import os
@@ -23,6 +24,8 @@ REPO_DEFAULT = "RoboX2020/agent-tasks"
 DEFAULT_WORKDIR = "/home/robotics"
 STATE_FILE = Path(__file__).parent / ".agent_state.json"
 TASKS_DIR = Path(__file__).parent / "tasks"
+ASSETS_DIR = Path(__file__).parent / "assets"
+AGY_BIN = "/home/robotics/.local/bin/agy"
 
 
 def load_state() -> Dict:
@@ -45,9 +48,14 @@ def save_state(state: Dict):
 
 def slugify(text: str) -> str:
     text = text.lower()
-    text = re.sub(r"\[.*?\]", "", text) # Remove tags like [ROBOT]
+    text = re.sub(r"\[.*?\]", "", text)
     text = re.sub(r"[^\w\s-]", "", text).strip()
     return re.sub(r"[-\s]+", "-", text)[:40] or "task"
+
+
+def clean_ansi(text: str) -> str:
+    """Strips terminal ANSI color/style escape sequences."""
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text).strip()
 
 
 def run_cmd(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict] = None, timeout: float = 300) -> Tuple[int, str, str]:
@@ -104,140 +112,129 @@ def close_issue(repo: str, issue_number: int, reason: str = "completed"):
     gh_cli(["issue", "close", str(issue_number), "--repo", repo, "--reason", reason])
 
 
-def extract_code_blocks(body: str) -> List[Tuple[str, str]]:
-    """Extracts (lang, code) blocks from markdown issue body."""
-    pattern = r"```([a-zA-Z0-9_-]+)?\n(.*?)```"
-    matches = re.findall(pattern, body, re.DOTALL)
-    blocks = []
-    for lang, code in matches:
-        lang = lang.lower().strip() or "bash"
-        blocks.append((lang, code.strip()))
-    return blocks
+def get_asset_files() -> Dict[str, float]:
+    """Returns mapping of existing files in assets/ to modification times."""
+    if not ASSETS_DIR.exists():
+        return {}
+    files = {}
+    for p in ASSETS_DIR.glob("*"):
+        if p.is_file():
+            files[p.name] = p.stat().st_mtime
+    return files
 
 
-def execute_task(issue: Dict, repo: str) -> Dict:
-    """Executes the task specified in the issue."""
+def run_ai_agent(issue: Dict, repo: str) -> Dict:
+    """
+    Hands off the full issue description to the Antigravity Agent (Gemini LLM)
+    which autonomously reasons, plans, executes tools, fixes code, renders simulations,
+    and returns a structured report.
+    """
     num = issue["number"]
     title = issue["title"]
     body = issue.get("body", "") or ""
     author = issue.get("author", {}).get("login", "unknown")
+    comments = issue.get("comments", [])
     start_time = datetime.datetime.now(datetime.timezone.utc)
 
-    print(f"\n{'='*70}")
-    print(f"[*] Processing Task #{num}: {title} (by @{author})")
-    print(f"{'='*70}")
+    # Compile user follow-up comments if any
+    extra_context = ""
+    if comments and isinstance(comments, list):
+        user_comments = [
+            c.get("body", "") for c in comments
+            if c.get("body", "") and not c.get("body", "").startswith("🤖")
+        ]
+        if user_comments:
+            extra_context = "\n\nADDITIONAL USER COMMENTS IN THREAD:\n" + "\n---\n".join(user_comments)
 
-    # 1. Post registration acknowledgment comment
+    # 1. Post live dispatch acknowledgment on GitHub
     ack_msg = (
-        f"🤖 **Agent Registered Task #{num}**\n\n"
+        f"🤖 **Autonomous AI Agent Dispatched for Task #{num}**\n\n"
         f"* **Task**: `{title}`\n"
-        f"* **Opened By**: @{author}\n"
+        f"* **Author**: @{author}\n"
+        f"* **Engine**: Google Antigravity Agent (Gemini)\n"
         f"* **Started At**: `{start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}`\n"
         f"* **Host**: `{socket.gethostname()}`\n"
-        f"* **Status**: ⏳ Working on task...\n"
+        f"* **Status**: 🧠 Comprehending user instructions, formulating execution plan, and running actions...\n"
     )
     post_comment(repo, num, ack_msg)
+    print(f"[*] Dispatched AI Agent for Issue #{num}...")
 
-    # 2. Extract code blocks or treat body as commands
-    code_blocks = extract_code_blocks(body)
-    results = []
+    # Snapshot asset directory state before agent run
+    pre_assets = get_asset_files()
 
-    if code_blocks:
-        print(f"[*] Found {len(code_blocks)} code block(s) to execute.")
-        for idx, (lang, code) in enumerate(code_blocks, 1):
-            print(f"[*] Executing Block {idx} ({lang})...")
-            if lang in ("bash", "sh", "shell", "zsh"):
-                rc, stdout, stderr = run_cmd(["bash", "-c", code])
-            elif lang in ("python", "python3", "py"):
-                # If code requires torch or isaaclab, route to IsaacLab python environment
-                if any(pkg in code for pkg in ("torch", "isaaclab", "isaacsim", "pxr", "warp")):
-                    isaac_py = "/home/robotics/isaac/IsaacLab/.venv/bin/python"
-                    if os.path.exists(isaac_py):
-                        gomp = {"LD_PRELOAD": "/lib/aarch64-linux-gnu/libgomp.so.1"}
-                        rc, stdout, stderr = run_cmd([isaac_py, "-c", code], env=gomp)
-                    else:
-                        rc, stdout, stderr = run_cmd(["python3", "-c", code])
-                else:
-                    rc, stdout, stderr = run_cmd(["python3", "-c", code])
-            else:
-                rc, stdout, stderr = run_cmd(["bash", "-c", code])
+    # 2. Build rich agent prompt
+    agent_prompt = f"""You are the autonomous Baxter Robotics & NVIDIA Isaac Sim AI Agent assigned to resolve GitHub Issue #{num} on {repo}.
 
-            results.append({
-                "block_index": idx,
-                "lang": lang,
-                "code": code,
-                "returncode": rc,
-                "stdout": stdout.strip(),
-                "stderr": stderr.strip()
-            })
-    else:
-        # Check if the title or body contains direct bash commands (e.g. baxter status)
-        first_line = body.strip().split("\n")[0] if body.strip() else ""
-        if any(first_line.startswith(prefix) for prefix in ("baxter ", "python ", "ls ", "git ", "echo ")):
-            print(f"[*] Executing direct command: {first_line}")
-            rc, stdout, stderr = run_cmd(["bash", "-c", first_line])
-            results.append({
-                "block_index": 1,
-                "lang": "bash",
-                "code": first_line,
-                "returncode": rc,
-                "stdout": stdout.strip(),
-                "stderr": stderr.strip()
-            })
-        else:
-            print("[*] Natural language instruction detected. Resolving intent...")
-            combined_text = f"{title} {body}".lower()
-            inferred_cmds = []
+ISSUE TITLE:
+{title}
 
-            if any(k in combined_text for k in ("screenshot", "photo", "render", "picture", "image")) and any(k in combined_text for k in ("sim", "isaac")):
-                inferred_cmds.append("baxter sim --screenshot assets/baxter_isaac_sim_wave.png --pose wave")
-            elif any(k in combined_text for k in ("launch baxter", "baxter in sim", "baxter in issac", "isaac sim", "issac sim")):
-                inferred_cmds.append("baxter sim --headless")
-            elif "status" in combined_text:
-                inferred_cmds.append("baxter status")
-            elif "enable" in combined_text:
-                inferred_cmds.append("baxter enable")
-            elif "disable" in combined_text:
-                inferred_cmds.append("baxter disable")
-            elif "tuck" in combined_text and "untuck" not in combined_text:
-                inferred_cmds.append("baxter tuck")
-            elif "untuck" in combined_text or "neutral" in combined_text:
-                inferred_cmds.append("baxter untuck")
-            elif "wave" in combined_text:
-                inferred_cmds.append("baxter move wave")
-            elif "dance" in combined_text:
-                inferred_cmds.append("baxter dance --no-audio")
-            elif "box" in combined_text:
-                inferred_cmds.append("baxter box --duration 15 --no-gui")
+REQUESTED BY:
+@{author}
 
-            if inferred_cmds:
-                for idx, cmd in enumerate(inferred_cmds, 1):
-                    print(f"[*] Executing inferred command {idx}: {cmd}")
-                    rc, stdout, stderr = run_cmd(["bash", "-c", cmd])
-                    results.append({
-                        "block_index": idx,
-                        "lang": "bash",
-                        "code": cmd,
-                        "returncode": rc,
-                        "stdout": stdout.strip(),
-                        "stderr": stderr.strip()
-                    })
-            else:
-                print("[*] No matching automated intent. Documenting task receipt.")
-                results.append({
-                    "block_index": 1,
-                    "lang": "text",
-                    "code": body,
-                    "returncode": 0,
-                    "stdout": f"Task instructions acknowledged: {body[:200]}...",
-                    "stderr": ""
-                })
+FULL USER DEMAND / INSTRUCTIONS:
+{body}
+{extra_context}
+
+SYSTEM & WORKSPACE ENVIRONMENT:
+- Main Workspaces:
+  * Baxter control library: /home/robotics/baxter-py (CLI: 'baxter')
+  * Task repository: /home/robotics/agent-tasks
+  * Isaac Sim / IsaacLab: /home/robotics/isaac/IsaacLab
+  * Baxter USD: /home/robotics/isaac/baxter.usd/baxter/baxter.usda
+- Physical Baxter Hardware:
+  * IP: 169.254.127.243:9090
+  * Parallel UDP: 127.0.0.1:19888
+- Core Command Tools:
+  * 'baxter status' - Inspect hardware interlocks, e-stop, and 7-DOF joint angles
+  * 'baxter enable' / 'baxter disable' - Arm motor power state
+  * 'baxter untuck' / 'baxter tuck' - Symmetrical operational posture or storage fold
+  * 'baxter move <neutral|wave|cheer|salute|reach|tuck>' - Execute calibrated routines
+  * 'baxter sim' - Launch Isaac Sim 3D digital twin
+  * 'baxter sim --screenshot <path> [--pose <neutral|wave|boxing|hero>]' - Direct photorealistic RTX renders
+  * 'baxter sim --sim-to-real' - Bidirectional parallel bridge
+  * 'baxter face <emotion>' - Render face emotion on 1024x600 LCD
+  * 'baxter dance' / 'baxter symphony' - High-level choreographies
+  * 'baxter box' / 'baxter play' - Computer vision interactive sparring partner
+  * Standard bash & python tools to inspect files, edit code, run diagnostics, and test changes.
+
+YOUR INSTRUCTIONS:
+1. Thoroughly read and comprehend the user's demands, instructions, edge cases, and constraints in the issue description.
+2. Formulate an execution plan and run whatever tools, commands, or simulation scripts are required.
+   * If screenshots or renders are requested, generate them into /home/robotics/agent-tasks/assets/.
+   * If code edits or improvements are requested, edit the files in place and test them.
+3. Verify that all requested actions succeeded.
+4. Output a comprehensive Markdown resolution report detailing:
+   * **Executive Summary**: Clear description of what was completed.
+   * **Actions & Commands Executed**: Technical breakdown of actions.
+   * **Results & Findings**: Key diagnostic values, test results, or status.
+   * **Deliverables**: List of generated files, screenshots, or code updates.
+   * **Notes / Next Steps for the User**.
+
+Execute the plan now and deliver your complete response."""
+
+    # 3. Execute Antigravity Agent CLI
+    agy_cmd = [
+        AGY_BIN if os.path.exists(AGY_BIN) else "agy",
+        "--dangerously-skip-permissions",
+        "-p", agent_prompt
+    ]
+
+    print(f"[*] Invoking Antigravity Agent CLI...")
+    rc, stdout, stderr = run_cmd(agy_cmd, cwd=str(Path(__file__).parent), timeout=420)
+    clean_agent_output = clean_ansi(stdout) if stdout else clean_ansi(stderr)
 
     end_time = datetime.datetime.now(datetime.timezone.utc)
     duration_sec = (end_time - start_time).total_seconds()
-    all_success = all(r["returncode"] == 0 for r in results)
+    success = (rc == 0 and bool(clean_agent_output))
 
-    # 3. Create documentation markdown file in tasks/
+    # Detect new or modified assets
+    post_assets = get_asset_files()
+    new_or_modified_assets = []
+    for fname, mtime in post_assets.items():
+        if fname not in pre_assets or mtime > pre_assets[fname]:
+            new_or_modified_assets.append(fname)
+
+    # 4. Save Task Documentation
     slug = slugify(title)
     report_filename = f"issue-{num}-{slug}.md"
     report_path = TASKS_DIR / report_filename
@@ -250,53 +247,64 @@ def execute_task(issue: Dict, repo: str) -> Dict:
 * **Started**: {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
 * **Completed**: {end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
 * **Duration**: {duration_sec:.2f} seconds
-* **Status**: {'✅ Success' if all_success else '❌ Failed'}
+* **Status**: {'✅ Success' if success else '❌ Failed / Timeout'}
+* **AI Engine**: Google Antigravity Agent (Gemini)
 
 ---
 
-## Task Instructions
+## User Request
 
 {body}
+{extra_context}
 
 ---
 
-## Execution Logs
+## AI Agent Execution & Resolution Report
+
+{clean_agent_output}
 
 """
-    for res in results:
-        report_content += f"### Block {res['block_index']} (`{res['lang']}`)\n\n"
-        report_content += f"**Input:**\n```{res['lang']}\n{res['code']}\n```\n\n"
-        report_content += f"**Exit Code:** `{res['returncode']}`\n\n"
-        if res['stdout']:
-            report_content += f"**Stdout:**\n```text\n{res['stdout']}\n```\n\n"
-        if res['stderr']:
-            report_content += f"**Stderr:**\n```text\n{res['stderr']}\n```\n\n"
+    if new_or_modified_assets:
+        report_content += "\n---\n\n## Generated Assets\n\n"
+        for asset in new_or_modified_assets:
+            if asset.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                report_content += f"![{asset}](../assets/{asset})\n\n"
+            else:
+                report_content += f"* [{asset}](../assets/{asset})\n"
 
     with open(report_path, "w") as f:
         f.write(report_content)
     print(f"[✓] Created task documentation at {report_path}")
 
-    # 4. Git commit and push task report & assets
+    # 5. Git Commit & Push
     repo_dir = str(Path(__file__).parent)
     run_cmd(["git", "add", "tasks/", "assets/", ".agent_state.json"], cwd=repo_dir)
-    run_cmd(["git", "commit", "-m", f"Complete task #{num}: {title}"], cwd=repo_dir)
+    run_cmd(["git", "commit", "-m", f"AI Agent resolved task #{num}: {title}"], cwd=repo_dir)
     run_cmd(["git", "push", "origin", "main"], cwd=repo_dir)
     print(f"[✓] Pushed changes to GitHub repository.")
 
-    # 5. Post resolution reply comment and close issue
+    # 6. Post Final Reply Comment & Close Issue
     report_url = f"https://github.com/{repo}/blob/main/tasks/{report_filename}"
     reply_msg = (
-        f"✅ **Task Completed: {title}**\n\n"
+        f"✅ **Task #{num} Resolved by AI Agent**\n\n"
         f"### 📋 Execution Summary:\n"
-        f"* **Status**: {'✅ Success' if all_success else '⚠️ Completed with errors'}\n"
+        f"* **Task**: `{title}`\n"
+        f"* **Status**: {'✅ Success' if success else '⚠️ Completed with warnings'}\n"
         f"* **Execution Time**: `{duration_sec:.2f}s`\n"
+        f"* **AI Engine**: Google Antigravity Agent (Gemini)\n"
         f"* **Detailed Report**: [{report_filename}]({report_url})\n\n"
     )
 
-    if results:
-        last = results[-1]
-        out_snippet = (last.get("stdout") or last.get("stderr") or "Execution completed cleanly.")[:1000]
-        reply_msg += f"### 🖥️ Output Preview:\n```text\n{out_snippet}\n```\n"
+    if new_or_modified_assets:
+        reply_msg += "### 🖼️ Generated Visual Artifacts:\n\n"
+        for asset in new_or_modified_assets:
+            if asset.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                raw_url = f"https://raw.githubusercontent.com/{repo}/main/assets/{asset}"
+                reply_msg += f"#### `{asset}`\n![{asset}]({raw_url})\n\n"
+
+    # Add agent summary preview
+    preview_snippet = clean_agent_output[:2500] if clean_agent_output else "Execution completed."
+    reply_msg += f"### 🧠 Agent Findings & Actions:\n\n{preview_snippet}\n"
 
     post_comment(repo, num, reply_msg)
     close_issue(repo, num)
@@ -305,49 +313,77 @@ def execute_task(issue: Dict, repo: str) -> Dict:
     return {
         "number": num,
         "title": title,
-        "success": all_success,
+        "success": success,
         "report": str(report_path)
     }
 
 
+def execute_task(issue: Dict, repo: str) -> Dict:
+    """Routes the issue to the LLM agent for complete comprehension and execution."""
+    num = issue["number"]
+    title = issue["title"]
+    author = issue.get("author", {}).get("login", "unknown")
+
+    print(f"\n{'='*70}")
+    print(f"[*] Processing Task #{num}: {title} (by @{author})")
+    print(f"{'='*70}")
+
+    return run_ai_agent(issue, repo)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Agent Tasks Monitor - GitHub Issue Worker")
+    parser = argparse.ArgumentParser(description="Agent Tasks Monitor - Autonomous GitHub Issue AI Agent")
     parser.add_argument("--repo", default=REPO_DEFAULT, help=f"GitHub repository (default: {REPO_DEFAULT})")
     parser.add_argument("--interval", type=int, default=10, help="Poll interval in seconds (default: 10)")
-    parser.add_argument("--once", action="store_true", help="Check once and exit")
+    parser.add_argument("--once", action="store_true", help="Process pending issues once and exit")
     args = parser.parse_args()
 
     print("=" * 70)
-    print("       🤖 AGENT TASKS - GITHUB ISSUE MONITOR 🤖")
+    print("       🤖 AGENT TASKS - GITHUB ISSUE AI AGENT MONITOR 🤖")
     print("=" * 70)
     print(f"  Target Repo:    {args.repo}")
+    print(f"  AI Engine:      Google Antigravity Agent (Gemini LLM)")
     print(f"  Poll Interval:  {args.interval} seconds")
     print(f"  Host:           {socket.gethostname()}")
     print("=" * 70)
 
     state = load_state()
+    processed_set = set(state.get("processed_issues", []))
 
     while True:
         try:
             issues = fetch_open_issues(args.repo)
-            for issue in issues:
-                num = issue["number"]
-                if num not in state["processed_issues"]:
+            unprocessed = [i for i in issues if i["number"] not in processed_set]
+
+            if unprocessed:
+                print(f"\n[*] Found {len(unprocessed)} new issue(s) to process.")
+                for issue in unprocessed:
+                    num = issue["number"]
                     try:
-                        execute_task(issue, args.repo)
-                        state["processed_issues"].append(num)
+                        res = execute_task(issue, args.repo)
+                        processed_set.add(num)
+                        state["processed_issues"] = list(processed_set)
                         save_state(state)
                     except Exception as e:
                         print(f"[!] Error processing issue #{num}: {e}")
-                        post_comment(args.repo, num, f"❌ **Agent Error**: Failed to complete task: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Mark as processed so it doesn't loop forever
+                        processed_set.add(num)
+                        state["processed_issues"] = list(processed_set)
+                        save_state(state)
 
-        except Exception as e:
-            print(f"[!] Monitor loop error: {e}")
+            if args.once:
+                break
 
-        if args.once:
+            time.sleep(args.interval)
+
+        except KeyboardInterrupt:
+            print("\n[*] Exiting Agent Tasks Monitor...")
             break
-
-        time.sleep(args.interval)
+        except Exception as e:
+            print(f"[!] Unexpected error in main monitor loop: {e}")
+            time.sleep(args.interval)
 
 
 if __name__ == "__main__":
