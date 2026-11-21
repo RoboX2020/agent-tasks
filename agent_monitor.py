@@ -185,15 +185,53 @@ def execute_task(issue: Dict, repo: str) -> Dict:
                 "stderr": stderr.strip()
             })
         else:
-            print("[*] Natural language instruction detected. Documenting task receipt.")
-            results.append({
-                "block_index": 1,
-                "lang": "text",
-                "code": body,
-                "returncode": 0,
-                "stdout": f"Task instructions acknowledged: {body[:200]}...",
-                "stderr": ""
-            })
+            print("[*] Natural language instruction detected. Resolving intent...")
+            combined_text = f"{title} {body}".lower()
+            inferred_cmds = []
+
+            if any(k in combined_text for k in ("screenshot", "photo", "render", "picture", "image")) and any(k in combined_text for k in ("sim", "isaac")):
+                inferred_cmds.append("baxter sim --screenshot assets/baxter_isaac_sim_wave.png --pose wave")
+            elif any(k in combined_text for k in ("launch baxter", "baxter in sim", "baxter in issac", "isaac sim", "issac sim")):
+                inferred_cmds.append("baxter sim --headless")
+            elif "status" in combined_text:
+                inferred_cmds.append("baxter status")
+            elif "enable" in combined_text:
+                inferred_cmds.append("baxter enable")
+            elif "disable" in combined_text:
+                inferred_cmds.append("baxter disable")
+            elif "tuck" in combined_text and "untuck" not in combined_text:
+                inferred_cmds.append("baxter tuck")
+            elif "untuck" in combined_text or "neutral" in combined_text:
+                inferred_cmds.append("baxter untuck")
+            elif "wave" in combined_text:
+                inferred_cmds.append("baxter move wave")
+            elif "dance" in combined_text:
+                inferred_cmds.append("baxter dance --no-audio")
+            elif "box" in combined_text:
+                inferred_cmds.append("baxter box --duration 15 --no-gui")
+
+            if inferred_cmds:
+                for idx, cmd in enumerate(inferred_cmds, 1):
+                    print(f"[*] Executing inferred command {idx}: {cmd}")
+                    rc, stdout, stderr = run_cmd(["bash", "-c", cmd])
+                    results.append({
+                        "block_index": idx,
+                        "lang": "bash",
+                        "code": cmd,
+                        "returncode": rc,
+                        "stdout": stdout.strip(),
+                        "stderr": stderr.strip()
+                    })
+            else:
+                print("[*] No matching automated intent. Documenting task receipt.")
+                results.append({
+                    "block_index": 1,
+                    "lang": "text",
+                    "code": body,
+                    "returncode": 0,
+                    "stdout": f"Task instructions acknowledged: {body[:200]}...",
+                    "stderr": ""
+                })
 
     end_time = datetime.datetime.now(datetime.timezone.utc)
     duration_sec = (end_time - start_time).total_seconds()
@@ -238,9 +276,9 @@ def execute_task(issue: Dict, repo: str) -> Dict:
         f.write(report_content)
     print(f"[✓] Created task documentation at {report_path}")
 
-    # 4. Git commit and push task report
+    # 4. Git commit and push task report & assets
     repo_dir = str(Path(__file__).parent)
-    run_cmd(["git", "add", "tasks/", ".agent_state.json"], cwd=repo_dir)
+    run_cmd(["git", "add", "tasks/", "assets/", ".agent_state.json"], cwd=repo_dir)
     run_cmd(["git", "commit", "-m", f"Complete task #{num}: {title}"], cwd=repo_dir)
     run_cmd(["git", "push", "origin", "main"], cwd=repo_dir)
     print(f"[✓] Pushed changes to GitHub repository.")
